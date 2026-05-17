@@ -3,10 +3,10 @@ package job
 import (
 	"encoding/json"
 
-	"github.com/mhsanaei/3x-ui/v2/logger"
-	"github.com/mhsanaei/3x-ui/v2/web/service"
-	"github.com/mhsanaei/3x-ui/v2/web/websocket"
-	"github.com/mhsanaei/3x-ui/v2/xray"
+	"github.com/mhsanaei/3x-ui/v3/logger"
+	"github.com/mhsanaei/3x-ui/v3/web/service"
+	"github.com/mhsanaei/3x-ui/v3/web/websocket"
+	"github.com/mhsanaei/3x-ui/v3/xray"
 
 	"github.com/valyala/fasthttp"
 )
@@ -24,7 +24,9 @@ func NewXrayTrafficJob() *XrayTrafficJob {
 	return new(XrayTrafficJob)
 }
 
-// Run collects traffic statistics from Xray and updates the database, triggering restart if needed.
+// Run collects traffic statistics from Xray, updates the database, and pushes
+// real-time updates over WebSocket using compact delta payloads — no REST
+// fallback, scales to 10k–20k+ clients per inbound.
 func (j *XrayTrafficJob) Run() {
 	if !j.xrayService.IsXrayRunning() {
 		return
@@ -33,13 +35,26 @@ func (j *XrayTrafficJob) Run() {
 	if err != nil {
 		return
 	}
-	err, needRestart0 := j.inboundService.AddTraffic(traffics, clientTraffics)
+	needRestart0, clientsDisabled, err := j.inboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add inbound traffic failed:", err)
 	}
 	err, needRestart1 := j.outboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add outbound traffic failed:", err)
+	}
+	if clientsDisabled {
+		restartOnDisable, settingErr := j.settingService.GetRestartXrayOnClientDisable()
+		if settingErr != nil {
+			logger.Warning("get RestartXrayOnClientDisable failed:", settingErr)
+		}
+		if restartOnDisable {
+			if err := j.xrayService.RestartXray(true); err != nil {
+				logger.Warning("restart xray after disabling clients failed:", err)
+				j.xrayService.SetToNeedRestart()
+			}
+		}
+		websocket.BroadcastInvalidate(websocket.MessageTypeInbounds)
 	}
 	if ExternalTrafficInformEnable, err := j.settingService.GetExternalTrafficInformEnable(); ExternalTrafficInformEnable {
 		j.informTrafficToExternalAPI(traffics, clientTraffics)
@@ -50,50 +65,81 @@ func (j *XrayTrafficJob) Run() {
 		j.xrayService.SetToNeedRestart()
 	}
 
-	// Get online clients and last online map for real-time status updates
-	onlineClients := j.inboundService.GetOnlineClients()
+	// If no frontend client is connected, skip all WebSocket broadcasting
+	// routines — including the active-client DB query and JSON marshaling.
+	if !websocket.HasClients() {
+		return
+	}
+
+	// Online presence + traffic deltas — small payload, always fits in WS.
+	// Force non-nil slice/map so JSON marshalling produces [] / {} instead of
+	// `null` when everyone is offline. The frontend's traffic handler treats
+	// a missing/null onlineClients field as "no update", so without this the
+	// "everyone went offline" transition was silently dropped — stale online
+	// users lingered in the list and the online filter kept showing them.
 	lastOnlineMap, err := j.inboundService.GetClientsLastOnline()
 	if err != nil {
 		logger.Warning("get clients last online failed:", err)
+	}
+	if lastOnlineMap == nil {
 		lastOnlineMap = make(map[string]int64)
 	}
 
-	// Fetch updated inbounds from database with accumulated traffic values
-	// This ensures frontend receives the actual total traffic, not just delta values
-	updatedInbounds, err := j.inboundService.GetAllInbounds()
-	if err != nil {
-		logger.Warning("get all inbounds for websocket failed:", err)
-	}
+	// Determine online clients from lastOnline timestamps with a 5-second
+	// grace period instead of just the current 5-second traffic poll. This
+	// prevents idle-but-connected clients from randomly disappearing from
+	// the UI between polling windows.
+	j.inboundService.RefreshOnlineClientsFromMap(lastOnlineMap)
 
-	updatedOutbounds, err := j.outboundService.GetOutboundsTraffic()
-	if err != nil {
-		logger.Warning("get all outbounds for websocket failed:", err)
+	onlineClients := j.inboundService.GetOnlineClients()
+	if onlineClients == nil {
+		onlineClients = []string{}
 	}
-
-	// Broadcast traffic update via WebSocket with accumulated values from database
-	trafficUpdate := map[string]any{
+	websocket.BroadcastTraffic(map[string]any{
 		"traffics":       traffics,
 		"clientTraffics": clientTraffics,
 		"onlineClients":  onlineClients,
 		"lastOnlineMap":  lastOnlineMap,
-	}
-	websocket.BroadcastTraffic(trafficUpdate)
+	})
 
-	// Broadcast full inbounds update for real-time UI refresh
-	if updatedInbounds != nil {
-		websocket.BroadcastInbounds(updatedInbounds)
+	// Full snapshot every cycle: absolute per-client counters and inbound
+	// totals. Frontend overwrites both in place. The previous delta path
+	// (activeEmails -> GetActiveClientTraffics) silently omitted the
+	// clients array whenever nobody moved bytes in the cycle, leaving the
+	// client rows in the UI stuck at stale traffic/remained/all-time.
+	clientStatsPayload := map[string]any{}
+	if stats, err := j.inboundService.GetAllClientTraffics(); err != nil {
+		logger.Warning("get all client traffics for websocket failed:", err)
+	} else if len(stats) > 0 {
+		clientStatsPayload["clients"] = stats
+	}
+	if inboundSummary, err := j.inboundService.GetInboundsTrafficSummary(); err != nil {
+		logger.Warning("get inbounds traffic summary for websocket failed:", err)
+	} else if len(inboundSummary) > 0 {
+		clientStatsPayload["inbounds"] = inboundSummary
+	}
+	if len(clientStatsPayload) > 0 {
+		websocket.BroadcastClientStats(clientStatsPayload)
 	}
 
-	if updatedOutbounds != nil {
+	// Outbounds list is small (one row per outbound, no per-client expansion)
+	// so the full snapshot still fits comfortably in WS.
+	if updatedOutbounds, err := j.outboundService.GetOutboundsTraffic(); err == nil && updatedOutbounds != nil {
 		websocket.BroadcastOutbounds(updatedOutbounds)
+	} else if err != nil {
+		logger.Warning("get all outbounds for websocket failed:", err)
 	}
-
 }
 
 func (j *XrayTrafficJob) informTrafficToExternalAPI(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) {
 	informURL, err := j.settingService.GetExternalTrafficInformURI()
 	if err != nil {
 		logger.Warning("get ExternalTrafficInformURI failed:", err)
+		return
+	}
+	informURL, err = service.SanitizePublicHTTPURL(informURL, false)
+	if err != nil {
+		logger.Warning("ExternalTrafficInformURI blocked:", err)
 		return
 	}
 	requestBody, err := json.Marshal(map[string]any{"clientTraffics": clientTraffics, "inboundTraffics": inboundTraffics})
